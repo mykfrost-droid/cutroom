@@ -1,0 +1,70 @@
+<!doctype html><meta charset="utf-8"><title>Cutroom audio and transition QA</title><h1>Audio and transition verification</h1><button id="run">Run browser checks</button><pre id="result">Ready</pre><iframe id="editor" style="width:1100px;height:700px" title="Editor test instance"></iframe>
+<script src="/timeline-engine.js"></script><script src="/video-export.js"></script><script>
+const result=document.querySelector('#result'),report=[];
+function check(condition,label){if(!condition)throw Error(label);report.push('PASS '+label);result.textContent=report.join('\n')}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function wave(){const count=96000,b=new ArrayBuffer(44+count*2),v=new DataView(b);const str=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));str(0,'RIFF');v.setUint32(4,b.byteLength-8,true);str(8,'WAVE');str(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,48000,true);v.setUint32(28,96000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);str(36,'data');v.setUint32(40,count*2,true);for(let i=0;i<count;i++)v.setInt16(44+i*2,Math.sin(i*2*Math.PI*440/48000)*.2*32767,true);return new Blob([b],{type:'audio/wav'})}
+async function decode(blob){const context=new AudioContext();try{return await context.decodeAudioData(await blob.arrayBuffer())}finally{await context.close()}}
+function rms(buffer,a=0,b=buffer.duration){const s=buffer.getChannelData(0);let energy=0,start=Math.floor(a*buffer.sampleRate),end=Math.min(s.length,Math.floor(b*buffer.sampleRate));for(let i=start;i<end;i++)energy+=s[i]*s[i];return Math.sqrt(energy/Math.max(1,end-start))}
+document.querySelector('#run').onclick=async()=>{try{
+  report.length=0;result.textContent='Generating audio/video fixture…';
+  const canvas=document.createElement('canvas');canvas.width=640;canvas.height=360;const context=canvas.getContext('2d');context.fillStyle='red';context.fillRect(0,0,640,360);
+  const audio=new AudioContext();await audio.resume();const dest=audio.createMediaStreamDestination(),tone=audio.createOscillator(),gain=audio.createGain();gain.gain.value=.2;tone.connect(gain);gain.connect(dest);tone.start();
+  const stream=canvas.captureStream(30);stream.addTrack(dest.stream.getAudioTracks()[0]);const recorder=new MediaRecorder(stream,{mimeType:'video/webm;codecs=vp8,opus'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);const stopped=new Promise(r=>recorder.onstop=r);recorder.start();const timer=setInterval(()=>{context.fillStyle=performance.now()%200>100?'red':'#c10';context.fillRect(0,0,640,360)},33);await sleep(1700);recorder.stop();await stopped;clearInterval(timer);tone.stop();stream.getTracks().forEach(t=>t.stop());await audio.close();
+  const fixture=new Blob(chunks,{type:'video/webm'}),wav=wave();await fetch('/source',{method:'POST',body:fixture});await fetch('/wave',{method:'POST',body:wav});
+  const media=[{id:'v',src:URL.createObjectURL(fixture),type:'video'},{id:'a',src:URL.createObjectURL(wav),type:'audio'}];
+  const makeClip=(id,extra={})=>({id,media:'v',duration:.8,in:0,speed:1,...extra});
+  const render=(clips)=>(out,time,lookup)=>TimelineEngine.paint(out,TimelineEngine.layout(clips),time,lookup);
+  let clips=[makeClip('one',{muted:true})];
+  let exported=await VideoExport.run({clips,media,ratio:16/9,resolution:'source',render:render(clips)});
+  let decoded=await decode(exported.blob);check(rms(decoded)<.003,'Muted clip exports silence');
+  const music=[{id:'music',media:'a',start:.2,in:0,duration:.4,volume:50,fadeIn:.1,fadeOut:.1}];
+  exported=await VideoExport.run({clips,media,music,ratio:16/9,resolution:'source',render:render(clips)});decoded=await decode(exported.blob);
+  check(rms(decoded,0,.1)<.005,'Music starts at its timeline offset');check(rms(decoded,.34,.44)>.035,'Background music is mixed into export');check(rms(decoded,.7,.78)<.005,'Music ends after its trimmed duration');
+  clips=[makeClip('first',{duration:.9,volume:50,fadeIn:.1}),makeClip('second',{duration:.9,in:.1,speed:1.25,volume:30,fadeOut:.15,transition:{kind:'dissolve',duration:.3}})];
+  exported=await VideoExport.run({clips,media,ratio:16/9,resolution:'source',render:render(clips)});decoded=await decode(exported.blob);await fetch('/artifact',{method:'POST',body:exported.blob});
+  check(rms(decoded)>.015,'Clip audio survives an overlapping transition and speed change');check(Math.abs(decoded.duration-1.5)<.15,'Transition overlap determines exported duration');check(exported.width===640&&exported.height===360,'Source resolution is preserved');
+  const images=[];for(const color of ['red','blue']){context.fillStyle=color;context.fillRect(0,0,640,360);const image=new Image();image.src=canvas.toDataURL();await image.decode();images.push(image)}
+  const output=document.createElement('canvas');output.width=100;output.height=100;
+  for(const [kind]of TimelineEngine.transitions.slice(1)){
+    const layout=TimelineEngine.layout([{id:'r',duration:1},{id:'b',duration:1,transition:{kind,duration:.4}}]);TimelineEngine.paint(output,layout,.8,id=>images[id==='r'?0:1]);const pixel=output.getContext('2d').getImageData(25,50,1,1).data;
+    if(kind==='fade-black')check(pixel[0]<3&&pixel[2]<3,'Fade through black renders black at midpoint');
+    else if(kind==='fade-white')check(pixel[0]>250&&pixel[2]>250,'Fade through white renders white at midpoint');
+    else if(kind==='dissolve'||kind==='zoom')check(pixel[0]>80&&pixel[2]>80,kind+' blends both images');
+    else if(kind.endsWith('left'))check(pixel[0]>200&&pixel[2]<10,kind+' moves in the correct direction');
+    else check(pixel[2]>200&&pixel[0]<10,kind+' moves in the correct direction');
+  }
+  // Exercise the actual application through its DOM on an isolated test origin.
+  const frame=document.querySelector('#editor');await new Promise(resolve=>{frame.onload=resolve;frame.src='/'});const w=frame.contentWindow,d=w.document;
+  const waitUntil=async(fn)=>{for(let i=0;i<150;i++){if(fn())return;await sleep(100)}throw Error('UI wait timed out')};
+  await waitUntil(()=>d.querySelectorAll('[data-clip]').length===4);
+  for(let i=0;i<4;i++)d.querySelector('#delete').click();
+  const transfer=new DataTransfer();transfer.items.add(new File([fixture],'sample.webm',{type:'video/webm'}));transfer.items.add(new File([wav],'music.wav',{type:'audio/wav'}));d.querySelector('#file').files=transfer.files;d.querySelector('#file').dispatchEvent(new w.Event('change'));
+  await waitUntil(()=>d.querySelector('#importStatus').textContent.includes('2 files imported'));
+  [...d.querySelectorAll('.media-card')].find(c=>c.textContent.includes('sample.webm')).querySelector('button').click();d.querySelector('#duplicate').click();
+  d.querySelector('[data-tab="Transitions"]').click();d.querySelector('[data-preset="dissolve"]').click();
+  check(d.querySelectorAll('.transition-marker').length===1,'Transition preset creates a marker in the actual timeline');
+  d.querySelector('[data-tab="Audio"]').click();d.querySelector('[data-add-music]').click();
+  check(d.querySelectorAll('.music-block').length===1,'Music is added to a separate timeline row');
+  const volume=d.querySelector('#audioVolume');volume.value=40;volume.dispatchEvent(new w.Event('input'));check(d.querySelector('#audioVolumeValue').value==='40%','Audio volume control updates');
+  check(d.querySelector('.music-block svg').children.length>0,'Imported music waveform is displayed');
+  await sleep(200);await new Promise(resolve=>{frame.onload=resolve;frame.contentWindow.location.reload()});await waitUntil(()=>frame.contentWindow.document.querySelectorAll('.music-block').length===1);
+  check(frame.contentWindow.document.querySelectorAll('.transition-marker').length===1,'Music and transitions survive project reload');
+  frame.contentWindow.document.querySelector('[data-music]').click();
+  check(frame.contentWindow.document.querySelector('#audioVolume').value==='40','Music volume survives project reload');
+  const editorWindow=frame.contentWindow,editorDocument=editorWindow.document;
+  editorDocument.querySelector('#play').click();await sleep(350);check(editorDocument.querySelector('#time').textContent.startsWith('00:00.')&&!editorDocument.querySelector('#toast').textContent.includes('failed'),'Preview starts with video and music');editorDocument.querySelector('#play').click();
+  // Capture the app's download link without writing a test video to the user's Downloads folder.
+  let downloadUrl;const nativeClick=editorWindow.HTMLAnchorElement.prototype.click;
+  editorWindow.HTMLAnchorElement.prototype.click=function(){downloadUrl=this.href};
+  try{
+    editorDocument.querySelector('#export').click();editorDocument.querySelector('#startExport').click();
+    await waitUntil(()=>downloadUrl||!editorDocument.querySelector('#exportError').hidden);
+    if(!downloadUrl)throw Error(editorDocument.querySelector('#exportError').textContent);
+    const actualExport=await (await fetch(downloadUrl)).blob(),actualAudio=await decode(actualExport);
+    check(rms(actualAudio)>.01,'The actual editor export button produces video with mixed audio');
+    check(actualAudio.duration>2.5&&actualAudio.duration<3.1,'The actual editor export uses transition overlap timing');
+  }finally{editorWindow.HTMLAnchorElement.prototype.click=nativeClick}
+  result.textContent=report.join('\n')+'\nALL BROWSER CHECKS PASSED';
+ }catch(error){result.textContent=report.join('\n')+'\nFAIL '+error.stack}};
+</script>

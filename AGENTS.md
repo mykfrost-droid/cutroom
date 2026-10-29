@@ -16,4 +16,4 @@
 - Pull main in VS Code: git pull --ff-only origin main
 - Serve the repository directory: npx serve .
 - Open the printed localhost URL. Hard-refresh after JavaScript changes.
-- The application source is index.html, style.css, app.js, media-import.js, and video-export.js. The ZIP is an old distribution artifact, not application source.
+- The application source is index.html, style.css, app.js, media-import.js, timeline-engine.js, and video-export.js. The ZIP is an old distribution artifact, not application source.
